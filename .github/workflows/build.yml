@@ -1,0 +1,81 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build (${{ matrix.rid }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Apple Silicon の Mac は署名のないバイナリを起動しない。macOS 上で publish すると ad-hoc 署名が付くので macOS ランナーでビルドする
+          - { os: macos-latest, rid: osx-arm64, exe: google-flights-mcp }
+          - { os: ubuntu-latest, rid: linux-x64, exe: google-flights-mcp }
+          - { os: windows-latest, rid: win-x64, exe: google-flights-mcp.exe }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-dotnet@v6
+        with:
+          # mise.toml の dotnet と揃える
+          dotnet-version: '10.0.402'
+
+      - name: Publish
+        shell: bash
+        run: |
+          version_args=()
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            version_args=(-p:Version="${GITHUB_REF_NAME#v}")
+          fi
+          dotnet publish src/GoogleFlightsMcp -c Release -r ${{ matrix.rid }} --self-contained \
+            -p:PublishSingleFile=true -p:DebugType=none "${version_args[@]}" -o dist
+
+      - name: Smoke test
+        run: python .github/scripts/smoke_test.py dist/${{ matrix.exe }}
+
+      # upload-artifact の zip では実行権限が落ちるので、tar.gz（Windows は zip）に固めてから上げる
+      - name: Package (tar.gz)
+        if: runner.os != 'Windows'
+        run: |
+          cp LICENSE README.md dist/
+          tar -czf google-flights-mcp-${{ matrix.rid }}.tar.gz -C dist .
+      - name: Package (zip)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Copy-Item LICENSE, README.md dist/
+          Compress-Archive -Path dist/* -DestinationPath google-flights-mcp-${{ matrix.rid }}.zip
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: google-flights-mcp-${{ matrix.rid }}
+          path: google-flights-mcp-${{ matrix.rid }}.*
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: packages
+          merge-multiple: true
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" packages/* \
+            --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes
